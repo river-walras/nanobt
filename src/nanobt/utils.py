@@ -1,6 +1,5 @@
-from tracemalloc import start
 from datetime import datetime, timezone
-from typing import Sequence, Union, Literal, Optional
+from typing import Literal, Optional
 
 import polars as pl
 import numpy as np
@@ -8,33 +7,16 @@ import numba as nb
 from numba import njit
 from numba.experimental import jitclass
 
-INVALID_MIN = 0
-INVALID_MAX = np.iinfo(np.int64).max - 1
-
-TIME_COL = Literal["exch_ts", "local_ts"]
-
-book_ticker_schema = {
-    "exchange": pl.String,
-    "symbol": pl.String,
-    "timestamp": pl.Int64,
-    "local_timestamp": pl.Int64,
-    "ask_amount": pl.Float64,
-    "ask_price": pl.Float64,
-    "bid_price": pl.Float64,
-    "bid_amount": pl.Float64,
-}
-
-
-trade_schema = {
-    "exchange": pl.String,
-    "symbol": pl.String,
-    "timestamp": pl.Int64,
-    "local_timestamp": pl.Int64,
-    "id": pl.String,
-    "side": pl.String,
-    "price": pl.Float64,
-    "amount": pl.Float64,
-}
+from .types import (
+    TIME_COL,
+    INVALID_MAX,
+    INVALID_MIN,
+    trade_schema,
+    book_ticker_schema,
+    FilesArg,
+    Kind,
+    Format,
+)
 
 
 @jitclass
@@ -69,12 +51,6 @@ def select_event(timestamps):
             earliest_ts = timestamps[i]
             ev = i
     return ev
-
-
-PathLike = str
-FilesArg = Union[PathLike, Sequence[PathLike]]
-Kind = Literal["trades", "book_ticker"]
-Format = Literal["parquet", "csv"]
 
 
 def datetime_to_ns(dt: datetime) -> int:
@@ -278,7 +254,7 @@ def ack_order(
 
 
 @njit
-def preprocess_data(
+def _preprocess_data(
     tick_size,
     end_ts,
     local_ts,
@@ -516,46 +492,136 @@ def preprocess_data(
     )
 
 
-if __name__ == "__main__":
+def generate_tardis_file_paths(
+    start_date: datetime,
+    end_date: datetime,
+    data_type: Literal["trades", "book_ticker"],
+    base_dir: str = "/share/tardis/raw/",
+    exchange: str = "binance-futures",
+    symbol: str = "BTCUSDT",
+    format: Format = "parquet",
+) -> list[str]:
+    """
+    Generate file paths for tardis data files within a date range.
+
+    Parameters
+    ----------
+    start_date : datetime
+        Start date (inclusive)
+    end_date : datetime
+        End date (exclusive)
+    data_type : Literal["trades", "book_ticker"]
+        Type of data files to generate paths for
+    base_dir : str
+        Base directory for tardis data
+    exchange : str
+        Exchange name
+    symbol : str
+        Trading symbol
+
+    Returns
+    -------
+    list[str]
+        List of file paths for the date range
+    """
+    from pathlib import Path
+    from datetime import timedelta
+
+    if format not in ("parquet", "csv"):
+        raise ValueError(f"Unsupported format: {format}")
+
+    if format == "csv":
+        _format = "csv.gz"  # Tardis CSV files are gzipped
+    else:
+        _format = format
+
+    file_paths = []
+    current_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date_normalized = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    while current_date < end_date_normalized:
+        date_str = current_date.strftime("%Y-%m-%d")
+        file_name = f"{exchange}_{data_type}_{date_str}_{symbol}.{_format}"
+        file_path = str(Path(base_dir) / exchange / data_type / symbol / file_name)
+        file_paths.append(file_path)
+        current_date += timedelta(days=1)
+
+    return file_paths
+
+
+def preprocess_data(
+    tick_size: float,
+    lot_size: float,
+    interval_ns: int,
+    start_date: datetime,
+    end_date: datetime,
+    format: Format = "parquet",
+    base_dir: str = "/share/tardis/raw/",
+    exchange: str = "binance-futures",
+    symbol: str = "BTCUSDT",
+    fixed_entry_lat_ns: int = 10_000_000,
+) -> pl.DataFrame:
+    """
+    Preprocess market data for backtesting.
+
+    Parameters
+    ----------
+    start_date : datetime
+        Start date for data processing
+    end_date : datetime
+        End date for data processing
+    tick_size : float
+        The minimum price increment for the trading instrument
+    lot_size : float
+        The minimum quantity increment for the trading instrument
+    base_dir : str
+        Base directory for tardis data files
+    exchange : str
+        Exchange name
+    symbol : str
+        Trading symbol
+    interval_ns : int
+        Interval in nanoseconds for running the backtest
+    fixed_entry_lat_ns : int
+        Fixed entry latency in nanoseconds
+
+    Returns
+    -------
+    pl.DataFrame
+        Preprocessed data with columns for local_ts, best_bid_tick, best_ask_tick, etc.
+    """
+    # Generate file paths
+    trades_files = generate_tardis_file_paths(
+        start_date, end_date, "trades", base_dir, exchange, symbol, format
+    )
+    book_ticker_files = generate_tardis_file_paths(
+        start_date, end_date, "book_ticker", base_dir, exchange, symbol, format
+    )
+
+    # Load data
     trade_exch_ts, _, trades = load_data(
-        [
-            "/share/tardis/raw/binance-futures/trades/BTCUSDT/binance-futures_trades_2025-11-17_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/trades/BTCUSDT/binance-futures_trades_2025-11-18_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/trades/BTCUSDT/binance-futures_trades_2025-11-19_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/trades/BTCUSDT/binance-futures_trades_2025-11-20_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/trades/BTCUSDT/binance-futures_trades_2025-11-21_BTCUSDT.parquet",
-        ],
+        trades_files,
         to_numpy=True,
         kind="trades",
+        format=format,
     )
     book_ticker_exch_ts, book_ticker_local_ts, book_ticker = load_data(
-        [
-            "/share/tardis/raw/binance-futures/book_ticker/BTCUSDT/binance-futures_book_ticker_2025-11-17_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/book_ticker/BTCUSDT/binance-futures_book_ticker_2025-11-18_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/book_ticker/BTCUSDT/binance-futures_book_ticker_2025-11-19_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/book_ticker/BTCUSDT/binance-futures_book_ticker_2025-11-20_BTCUSDT.parquet",
-            "/share/tardis/raw/binance-futures/book_ticker/BTCUSDT/binance-futures_book_ticker_2025-11-21_BTCUSDT.parquet",
-        ],
+        book_ticker_files,
         to_numpy=True,
         kind="book_ticker",
+        format=format,
     )
-    tick_size = 0.1
-    lot_size = 0.001
 
-    running_interval = 1_000_000_000
-    start_ts = (
-        int(datetime(2025, 11, 17, tzinfo=timezone.utc).timestamp() * 1_000_000_000)
-        + running_interval
-    )
-    end_ts = int(
-        datetime(2025, 11, 22, tzinfo=timezone.utc).timestamp() * 1_000_000_000
-    )
+    # Generate timestamps
+    start_ts = int(start_date.timestamp() * 1_000_000_000) + interval_ns
+    end_ts = int(end_date.timestamp() * 1_000_000_000)
 
     # In the final interval, to compute fill prices after order acknowledgment,
     # a small buffer beyond `end_ts` is necessary.
-    local_ts = np.arange(start_ts, end_ts + running_interval, running_interval)
+    local_ts = np.arange(start_ts, end_ts + interval_ns, interval_ns)
 
-    out = preprocess_data(
+    # Preprocess data
+    out = _preprocess_data(
         tick_size,
         end_ts,
         local_ts,
@@ -564,9 +630,10 @@ if __name__ == "__main__":
         book_ticker,
         trade_exch_ts,
         trades,
-        fixed_entry_lat_ns=10_000_000,  # 10ms
+        fixed_entry_lat_ns=fixed_entry_lat_ns,
     )
 
+    # Create DataFrame
     table = pl.DataFrame(
         {
             "local_ts": out[0],
@@ -584,4 +651,4 @@ if __name__ == "__main__":
         }
     )
 
-    print(table)
+    return table
