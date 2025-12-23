@@ -11,8 +11,6 @@ from .types import (
     TIME_COL,
     INVALID_MAX,
     INVALID_MIN,
-    trade_schema,
-    book_ticker_schema,
     FilesArg,
     Kind,
     Format,
@@ -100,7 +98,7 @@ def load_data(
         raise ValueError(f"Unsupported format: {format}")
 
     if kind == "trades":
-        lf = scan_fn(source, schema=trade_schema).select(
+        lf = scan_fn(source).select(
             pl.when(pl.col("side") == "buy")
             .then(1)
             .otherwise(-1)
@@ -115,7 +113,7 @@ def load_data(
         )
 
     elif kind == "book_ticker":
-        lf = scan_fn(source, schema=book_ticker_schema).select(
+        lf = scan_fn(source).select(
             (pl.col("timestamp") * 1000).cast(pl.Int64, strict=True).alias("exch_ts"),
             (pl.col("local_timestamp") * 1000)
             .cast(pl.Int64, strict=True)
@@ -316,8 +314,12 @@ def _preprocess_data(
     out_local_ts = np.empty(out_size, np.int64)
     # best bid at local at local_ts[t]
     out_best_bid_tick = np.empty(out_size, np.int64)
+    # best bid qty at local at local_ts[t]
+    out_best_bid_qty = np.empty(out_size, np.float64)
     # best ask at local at local_ts[t]
     out_best_ask_tick = np.empty(out_size, np.int64)
+    # out best ask qty at local at local_ts[t]
+    out_best_ask_qty = np.empty(out_size, np.float64)
     # bid fill price in ticks for the interval local_ts[t - 1] ~ local_ts[t]
     # any open buy orders during this interval with a price greater than or equal to this price are considered filled.
     out_bid_fill_tick = np.empty(out_size, np.int64)
@@ -347,6 +349,8 @@ def _preprocess_data(
 
     local_best_bid_tick = exch_best_bid_tick = INVALID_MIN
     local_best_ask_tick = exch_best_ask_tick = INVALID_MAX
+    local_best_bid_qty = 0.0
+    local_best_ask_qty = 0.0
     high_buy_tick = high_best_bid_tick = INVALID_MIN
     low_sell_tick = low_best_ask_tick = INVALID_MAX
 
@@ -400,6 +404,8 @@ def _preprocess_data(
             local_best_ask_tick = round(
                 book_ticker[book_ticker_local_clock.rn].ask_px / tick_size
             )
+            local_best_bid_qty = book_ticker[book_ticker_local_clock.rn].bid_qty
+            local_best_ask_qty = book_ticker[book_ticker_local_clock.rn].ask_qty
 
             book_ticker_local_clock.next()
         elif ev == 2:
@@ -427,7 +433,9 @@ def _preprocess_data(
             # Records the current local state at local_ts[t].
             out_local_ts[out_t] = local_clock.ts
             out_best_bid_tick[out_t] = local_best_bid_tick
+            out_best_bid_qty[out_t] = local_best_bid_qty
             out_best_ask_tick[out_t] = local_best_ask_tick
+            out_best_ask_qty[out_t] = local_best_ask_qty
 
             # Order acknowledgement timestamp when the exchange receives the order request.
             # order_entry_latency = order_latency.entry(local_clock.ts)
@@ -479,7 +487,9 @@ def _preprocess_data(
     return (
         out_local_ts[:out_t],
         out_best_bid_tick[:out_t],
+        out_best_bid_qty[:out_t],
         out_best_ask_tick[:out_t],
+        out_best_ask_qty[:out_t],
         out_bid_fill_tick[:out_t],
         out_ask_fill_tick[:out_t],
         out_order_ack_ts[:out_t],
@@ -551,15 +561,16 @@ def generate_tardis_file_paths(
 
 def preprocess_data(
     tick_size: float,
-    lot_size: float,
     interval_ns: int,
     start_date: datetime,
     end_date: datetime,
     format: Format = "parquet",
-    base_dir: str = "/share/tardis/raw/",
-    exchange: str = "binance-futures",
-    symbol: str = "BTCUSDT",
-    fixed_entry_lat_ns: int = 10_000_000,
+    trades_files: FilesArg | None = None,
+    book_ticker_files: FilesArg | None = None,
+    base_dir: str | None = None,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    fixed_entry_lat_ns: int = 10_000_000, # 10 ms
 ) -> pl.DataFrame:
     """
     Preprocess market data for backtesting.
@@ -590,12 +601,18 @@ def preprocess_data(
     pl.DataFrame
         Preprocessed data with columns for local_ts, best_bid_tick, best_ask_tick, etc.
     """
+    if not (trades_files and book_ticker_files):
+        if not (base_dir and exchange and symbol):
+            raise ValueError(
+                "Either provide trades_files and book_ticker_files, or base_dir, exchange, and symbol."
+            )
+
     # Generate file paths
-    trades_files = generate_tardis_file_paths(
-        start_date, end_date, "trades", base_dir, exchange, symbol, format
+    trades_files = trades_files or generate_tardis_file_paths(
+        start_date, end_date, "trades", base_dir, exchange, symbol, format # type: ignore
     )
-    book_ticker_files = generate_tardis_file_paths(
-        start_date, end_date, "book_ticker", base_dir, exchange, symbol, format
+    book_ticker_files = book_ticker_files or generate_tardis_file_paths(
+        start_date, end_date, "book_ticker", base_dir, exchange, symbol, format # type: ignore
     )
 
     # Load data
@@ -638,16 +655,18 @@ def preprocess_data(
         {
             "local_ts": out[0],
             "best_bid_tick": out[1],
-            "best_ask_tick": out[2],
-            "bid_fill_tick": out[3],
-            "ask_fill_tick": out[4],
-            "order_ack_ts": out[5],
-            "bid_fill_tick_ack": out[6],
-            "ask_fill_tick_ack": out[7],
-            "best_bid_tick_ack": out[8],
-            "best_ask_tick_ack": out[9],
-            "bid_fill_tick_after_ack": out[10],
-            "ask_fill_tick_after_ack": out[11],
+            "best_bid_qty": out[2],
+            "best_ask_tick": out[3],
+            "best_ask_qty": out[4],
+            "bid_fill_tick": out[5],
+            "ask_fill_tick": out[6],
+            "order_ack_ts": out[7],
+            "bid_fill_tick_ack": out[8],
+            "ask_fill_tick_ack": out[9],
+            "best_bid_tick_ack": out[10],
+            "best_ask_tick_ack": out[11],
+            "bid_fill_tick_after_ack": out[12],
+            "ask_fill_tick_after_ack": out[13],
         }
     )
 

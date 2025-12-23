@@ -207,7 +207,6 @@ def main():
     lot_size = 0.001
     table = preprocess_data(
         tick_size=tick_size,
-        lot_size=lot_size,
         interval_ns=1_000_000_000,
         start_date=datetime(2025, 11, 5, tzinfo=UTC),
         end_date=datetime(2025, 11, 10, tzinfo=UTC),

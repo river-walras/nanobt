@@ -1,7 +1,5 @@
 # NanoBT - 纳秒级加速回测框架
 
-一个基于 Python + Numba JIT 的高性能量化交易回测引擎，通过预计算订单成交条件实现**接近真实交易的延迟模拟**，相比逐笔重放市场数据的传统回测方法提速超过 **100 倍**。
-
 ## 核心设计理念
 
 ### 加速原理：预计算成交条件
@@ -440,8 +438,7 @@ def accelerated_backtest(...):
 ## 依赖环境
 
 ```bash
-# Python >= 3.9
-pip install numpy numba polars
+uv sync
 ```
 
 核心依赖：
@@ -465,12 +462,3 @@ nanobt/
 │       └── utils.py          # 辅助函数
 └── README.md
 ```
-
----
-
-## 参考资料
-
-本项目深度参考了 [HftBacktest](https://github.com/nkaz001/hftbacktest) 的设计思路：
-- **Accelerated Backtesting**：预计算填充价格的核心方法
-- **延迟模拟**：订单确认时间戳的分离计算
-- **数据预处理**：事件驱动的多时间线处理

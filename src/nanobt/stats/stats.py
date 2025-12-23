@@ -81,6 +81,26 @@ class Stats:
         Args:
             pretty: Returns the statistics in a pretty-printed format.
         """
+        if pretty:
+            try:
+                from rich.table import Table # type: ignore
+                from rich.console import Console # type: ignore
+            except ImportError:
+                raise ImportError('rich is required for pretty printing. Please install it via `pip install rich`.')
+
+            table = Table(show_header=True, header_style="bold magenta")
+            keys = list(self.splits[-1].keys())
+            for key in keys:
+                table.add_column(key)
+
+            for split in self.splits:
+                row = [str(split[key]) for key in keys]
+                table.add_row(*row)
+
+            console = Console()
+            console.print(table)
+            return
+
         df = pl.DataFrame(self.splits)
         return df
 
@@ -101,7 +121,10 @@ class Stats:
             raise ValueError(f'{backend} is unsupported')
 
     def plot_holoviews(self, price_as_ret: bool = False):
-        import holoviews as hv # type: ignore
+        try:
+            import holoviews as hv # type: ignore
+        except ImportError:
+            raise ImportError('holoviews is required for plotting with the holoviews backend. Please install it via `pip install holoviews`.')
 
         entire_df = self.entire
         kwargs = self.kwargs
