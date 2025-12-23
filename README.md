@@ -1,223 +1,223 @@
-# NanoBT - 纳秒级加速回测框架
+# NanoBT - Nanosecond-Level Accelerated Backtesting Framework
 
-## 核心设计理念
+## Core Design Principles
 
-### 加速原理：预计算成交条件
+### Acceleration Method: Pre-computed Fill Prices
 
-传统回测需要逐笔重放市场深度数据并模拟订单簿队列位置，而 NanoBT 采用**预计算填充价格**（Fill Price）的方法：
+Traditional backtesting requires tick-by-tick replay of market depth data and simulation of order book queue positions, while NanoBT uses a **pre-computed fill price** approach:
 
-- **买单成交条件**：订单价格 ≥ 区间内最低卖价 或 > 最低主动卖成交价
-- **卖单成交条件**：订单价格 ≤ 区间内最高买价 或 < 最高主动买成交价
+- **Buy Order Fill Condition**: Order price ≥ minimum ask price in interval or > minimum active sell execution price
+- **Sell Order Fill Condition**: Order price ≤ maximum bid price in interval or < maximum active buy execution price
 
-**权衡**：不建模队列位置，订单要么完全成交要么不成交（无部分成交）。在高流动性市场（如主流加密货币合约）中，这种简化对大多数策略的精度影响可接受。
+**Trade-off**: Queue position is not modeled; orders are either fully filled or not filled (no partial fills). In high-liquidity markets (such as mainstream cryptocurrency futures), this simplification is acceptable for most strategies' accuracy.
 
 ---
 
-## 撮合逻辑详解
+## Detailed Explanation of Matching Logic
 
-### 时间线切分：三个关键窗口
+### Time Axis Segmentation: Three Key Windows
 
-回测系统将时间线切分为三个窗口，分别处理不同状态的订单成交判定：
+The backtesting system divides the time axis into three windows, handling different states of order fill determination:
 
 ```
-时间线：
+Time axis:
     local_ts[t-1]      local_ts[t]         order_ack_ts[t]      local_ts[t+n]
         |                  |                     |                   |
         |<------ W0 ------>|<------- W1 -------->|<------ W2 ------->|
-       遗留订单成交判定     撤单/改单来不及判定      新订单成交判定
+    legacy order fill    cancel/modify timeout    new order fill
 ```
 
-#### **W0: 遗留订单窗口** `[local_ts[t-1], local_ts[t]]`
-判断上一次策略运行后挂在交易所的订单（open orders）是否在当前时刻之前被成交。
+#### **W0: Legacy Order Window** `[local_ts[t-1], local_ts[t]]`
+Determines if open orders submitted in the previous strategy execution are filled before the current timestamp.
 
-- **输出数据**：
-  - `bid_fill_tick`：买单成交价（tick），任何价格 ≥ 此值的挂单视为成交
-  - `ask_fill_tick`：卖单成交价（tick），任何价格 ≤ 此值的挂单视为成交
+- **Output Data**:
+  - `bid_fill_tick`: Buy order fill price (in ticks); any open order at price ≥ this value is considered filled
+  - `ask_fill_tick`: Sell order fill price (in ticks); any open order at price ≤ this value is considered filled
 
-- **计算方法**（见 [utils.py:417-420](src/nanobt/utils.py#L417-L420)）：
+- **Calculation Method** (see [utils.py:417-420](src/nanobt/utils.py#L417-L420)):
   ```python
-  # 区间内最低主动卖成交价 + 1 tick，与最低卖一价取较小值
+  # Lowest active sell execution price + 1 tick, minimum with lowest ask
   bid_fill_tick = min(low_sell_tick + 1, low_best_ask_tick)
-  # 区间内最高主动买成交价 - 1 tick，与最高买一价取较大值
+  # Highest active buy execution price - 1 tick, maximum with highest bid
   ask_fill_tick = max(high_buy_tick - 1, high_best_bid_tick)
   ```
 
-#### **W1: 订单修改延迟窗口** `[local_ts[t], order_ack_ts[t]]`
-本地在 `t` 时刻发出撤单/改单请求后，请求到达交易所前，原有订单是否会**抢先成交**（撤单/改单来不及）。
+#### **W1: Order Modification Latency Window** `[local_ts[t], order_ack_ts[t]]`
+After the local system sends a cancel/modify request at time `t`, determines if the original order will be **filled before the request arrives** at the exchange (cancel/modify timeout).
 
-- **输出数据**：
-  - `bid_fill_tick_ack`：买单延迟成交价（tick）
-  - `ask_fill_tick_ack`：卖单延迟成交价（tick）
-  - `best_bid_tick_ack`：交易所收到订单时的最优买价（用于 GTX 订单拒绝判定）
-  - `best_ask_tick_ack`：交易所收到订单时的最优卖价（用于 GTX 订单拒绝判定）
+- **Output Data**:
+  - `bid_fill_tick_ack`: Buy order latency fill price (in ticks)
+  - `ask_fill_tick_ack`: Sell order latency fill price (in ticks)
+  - `best_bid_tick_ack`: Best bid price when the exchange receives the order (for GTX rejection)
+  - `best_ask_tick_ack`: Best ask price when the exchange receives the order (for GTX rejection)
 
-- **应用场景**（见 [main.py:111-128](main.py#L111-L128)）：
-  当策略试图撤销或修改订单时，需要判断在订单到达交易所之前是否已被成交：
+- **Use Case** (see [main.py:111-128](main.py#L111-L128)):
+  When the strategy attempts to cancel or modify an order, determine if it has already been filled before reaching the exchange:
   ```python
-  # 检查挂单是否在订单到达交易所前成交
+  # Check if the open order is filled before reaching the exchange
   if open_bid_tick > INVALID_MIN and open_bid_tick >= bid_fill_tick_ack[t]:
-      # 买单成交：扣除资金，增加持仓
+      # Buy order filled: deduct balance, increase position
       balance -= open_bid_tick * open_bid_qty
       position += open_bid_qty
   ```
 
-#### **W2: 新订单窗口** `[order_ack_ts[t], local_ts[t+n]]`
-交易所确认订单后，到下一次策略观测点之间，新订单是否会被成交。
+#### **W2: New Order Window** `[order_ack_ts[t], local_ts[t+n]]`
+After the exchange confirms the order, determines if the new order will be filled before the next strategy observation point.
 
-- **输出数据**：
-  - `bid_fill_tick_after_ack`：新买单成交价（tick）
-  - `ask_fill_tick_after_ack`：新卖单成交价（tick）
+- **Output Data**:
+  - `bid_fill_tick_after_ack`: New buy order fill price (in ticks)
+  - `ask_fill_tick_after_ack`: New sell order fill price (in ticks)
 
-- **注意**：这里的 `local_ts[t+n]` 不一定是 `t+1`，因为订单延迟可能跨越多个本地时间步。
+- **Note**: `local_ts[t+n]` here is not necessarily `t+1`, as order latency may span multiple local time steps.
 
 ---
 
-### 延迟模拟：订单确认时间戳
+### Latency Simulation: Order Acknowledgment Timestamp
 
-系统通过 `order_ack_ts` 模拟订单从本地发送到交易所确认的**单程延迟**（Entry Latency）：
+The system simulates the **one-way latency** (Entry Latency) from local system to exchange via `order_ack_ts`:
 
 ```python
 # utils.py:434
 order_ack_ts = local_ts[t] + fixed_entry_lat_ns
 ```
 
-- **默认延迟**：10ms（`fixed_entry_lat_ns = 10_000_000` 纳秒）
-- **改进方向**：可扩展为基于历史数据的插值延迟模型（参考 HftBacktest 的 `IntpOrderLatency`）
+- **Default Latency**: 10ms (`fixed_entry_lat_ns = 10_000_000` nanoseconds)
+- **Future Improvements**: Can be extended to interpolation-based latency models from historical data (reference HftBacktest's `IntpOrderLatency`)
 
-**重要限制**：订单状态变化（受理/取消/成交/持仓更新）在**本地端立即生效**，不计入订单应答延迟。这是为了避免维护本地和交易所两套状态的复杂性。
+**Important Limitation**: Order state changes (acknowledgment/cancellation/fill/position update) take effect **locally immediately**, not included in order response latency. This avoids the complexity of maintaining separate local and exchange states.
 
 ---
 
-### GTX 订单类型：防止立即成交
+### GTX Order Type: Prevent Immediate Execution
 
-系统将所有限价单视为 **GTX（Good-Till-Crossing）** 订单，即"只挂单不吃单"：
+The system treats all limit orders as **GTX (Good-Till-Crossing)** orders, meaning "post-only":
 
 ```python
 # main.py:130-138
-# 如果买单价格 ≥ 卖一价，或卖单价格 ≤ 买一价，订单被拒绝
+# If buy order price >= ask, or sell order price <= bid, order is rejected
 if req_bid_tick >= best_ask_tick_ack[t]:
-    req_bid_tick = INVALID_MIN  # 拒绝订单
+    req_bid_tick = INVALID_MIN  # Reject order
 if req_ask_tick <= best_bid_tick_ack[t]:
-    req_ask_tick = INVALID_MAX  # 拒绝订单
+    req_ask_tick = INVALID_MAX  # Reject order
 ```
 
 这避免了策略因"越过价差"而吃掉对手单，确保**只做 Maker 不做 Taker**。
 
 ---
 
-### 订单状态管理：四个价格变量
+### Order State Management: Four Price Variables
 
-系统使用四个变量追踪订单生命周期（见 [main.py:30-45](main.py#L30-L45)）：
+The system uses four variables to track the order lifecycle (see [main.py:30-45](main.py#L30-L45)):
 
 ```python
-# 待确认的订单（本地已发送，交易所未确认）
-req_bid_tick = INVALID_MIN  # 待确认买单价格（tick）
-req_ask_tick = INVALID_MAX  # 待确认卖单价格（tick）
+# Unacknowledged orders (locally sent, exchange not confirmed)
+req_bid_tick = INVALID_MIN  # Pending buy order price (in ticks)
+req_ask_tick = INVALID_MAX  # Pending sell order price (in ticks)
 
-# 已确认的订单（交易所已接受，正在挂单）
-open_bid_tick = INVALID_MIN  # 挂单中的买单价格（tick）
-open_ask_tick = INVALID_MAX  # 挂单中的卖单价格（tick）
+# Acknowledged orders (exchange accepted, order open in market)
+open_bid_tick = INVALID_MIN  # Buy order price in market (in ticks)
+open_ask_tick = INVALID_MAX  # Sell order price in market (in ticks)
 ```
 
-- **INVALID_MIN / INVALID_MAX**：特殊标记值，表示"无订单"或"订单已成交"
-  - `INVALID_MIN = 0`：用于买单
-  - `INVALID_MAX = 2^63 - 2`：用于卖单
+- **INVALID_MIN / INVALID_MAX**: Special marker values indicating "no order" or "order filled"
+  - `INVALID_MIN = 0`: Used for buy orders
+  - `INVALID_MAX = 2^63 - 2`: Used for sell orders
 
-**订单取消逻辑**（见 [main.py:38-40](main.py#L38-L40)）：
+**Order Cancellation Logic** (see [main.py:38-40](main.py#L38-L40)):
 ```python
-# 如果 req_bid_tick 为 INVALID_MIN 且有挂单，则发送撤单请求
-# （如果撤单请求在订单成交前到达交易所，订单会被取消）
+# If req_bid_tick is INVALID_MIN and there is an open buy order, send cancel request
+# (If cancel request reaches exchange before order fills, order will be canceled)
 if req_bid_tick == INVALID_MIN and open_bid_tick > INVALID_MIN:
-    # 交易所将在 order_ack_ts[t] 处理撤单，前提是订单未在 W1 窗口成交
+    # Exchange will process cancellation at order_ack_ts[t], provided order hasn't filled in W1 window
 ```
 
 ---
 
-## 策略示例：偏度做市策略
+## Example Strategy: Skew Market Making Strategy
 
-内置的示例策略（[main.py:64-84](main.py#L64-L84)）实现了一个**仓位倾斜型双边做市策略**：
+The built-in example strategy (see [main.py:64-84](main.py#L64-L84)) implements a **position-skewed dual-sided market-making strategy**:
 
-### 核心思路
-1. 在中间价上下对称挂单做市
-2. 根据当前持仓动态调整买卖挂单深度（偏度，Skew）
-3. 达到风险限额时单边停止挂单
+### Core Concept
+1. Place symmetric market making orders above and below the mid price
+2. Dynamically adjust buy/sell order depth (skew) based on current position
+3. Stop one-sided order placement when reaching risk limits
 
-### 参数配置
+### Parameter Configuration
 ```python
-relative_half_spread = 0.00025  # 半价差：0.025%（挂单距中间价的基础距离）
-skew = 0.00025                  # 偏度系数：根据持仓调整挂单距离
-order_notional_value = 50000    # 单次订单名义价值：$50,000
-max_notional_position = 1000000 # 最大持仓名义价值：$1,000,000（20倍杠杆）
+relative_half_spread = 0.00025  # Half spread: 0.025% (base distance from mid price)
+skew = 0.00025                  # Skew coefficient: adjust order distance based on position
+order_notional_value = 50000    # Order notional value per order: $50,000
+max_notional_position = 1000000 # Max position notional value: $1,000,000 (20x leverage)
 ```
 
-### 挂单逻辑
+### Order Placement Logic
 ```python
-mid_tick = (best_bid_tick[t] + best_ask_tick[t]) / 2.0  # 中间价
-normalized_position = (position * mid_px) / max_notional_position  # 归一化持仓 ∈ [-1, 1]
+mid_tick = (best_bid_tick[t] + best_ask_tick[t]) / 2.0  # Mid price
+normalized_position = (position * mid_px) / max_notional_position  # Normalized position ∈ [-1, 1]
 
-# 根据持仓偏度调整买卖深度
+# Adjust buy/sell depth based on position skew
 relative_bid_depth = relative_half_spread + skew * normalized_position
 relative_ask_depth = relative_half_spread - skew * normalized_position
 
-# 计算挂单价格（不能穿过盘口）
+# Calculate order prices (must not cross spread)
 req_bid_tick = min(floor(mid_tick * (1 - relative_bid_depth)), best_bid_tick[t])
 req_ask_tick = max(ceil(mid_tick * (1 + relative_ask_depth)), best_ask_tick[t])
 
-# 风险控制：超过限额时停止对应方向挂单
-if normalized_position > 1:  # 多仓超限
-    req_bid_tick = INVALID_MIN  # 停止买入
-if normalized_position < -1:  # 空仓超限
-    req_ask_tick = INVALID_MAX  # 停止卖出
+# Risk control: stop one-sided orders at position limits
+if normalized_position > 1:  # Long position over limit
+    req_bid_tick = INVALID_MIN  # Stop buying
+if normalized_position < -1:  # Short position over limit
+    req_ask_tick = INVALID_MAX  # Stop selling
 ```
 
-**偏度效果**：
-- 持多仓时，买单深度增加（不激进买入），卖单深度减小（激进卖出平仓）
-- 持空仓时，卖单深度增加（不激进卖出），买单深度减小（激进买入平仓）
+**Skew Effect**:
+- When long: buy order depth increases (less aggressive buy), sell order depth decreases (aggressive sell to close)
+- When short: sell order depth increases (less aggressive sell), buy order depth decreases (aggressive buy to close)
 
 ---
 
-## 数据预处理流程
+## Data Preprocessing Pipeline
 
-### 输入数据要求
+### Input Data Requirements
 
-系统需要两类原始市场数据（Tardis 格式）：
+The system requires two types of raw market data (Tardis format):
 
-1. **逐笔成交数据** (`trades`)
+1. **Trade-by-trade data** (`trades`)
    ```python
-   # 必需字段：timestamp, local_timestamp, side, price, amount
-   side: 1 (buy) / -1 (sell)  # 主动买/卖方向
+   # Required fields: timestamp, local_timestamp, side, price, amount
+   side: 1 (buy) / -1 (sell)  # Active buy/sell direction
    ```
 
-2. **最优报价数据** (`book_ticker`)
+2. **Best bid/ask data** (`book_ticker`)
    ```python
-   # 必需字段：timestamp, local_timestamp, bid_price, bid_amount, ask_price, ask_amount
+   # Required fields: timestamp, local_timestamp, bid_price, bid_amount, ask_price, ask_amount
    ```
 
-### 预处理步骤
+### Preprocessing Steps
 
-[preprocess_data](src/nanobt/utils.py#L552-L654) 函数的核心流程：
+[preprocess_data](src/nanobt/utils.py#L552-L654) function's core workflow:
 
-1. **加载数据**（支持 Parquet/CSV 格式）
+1. **Load data** (supports Parquet/CSV format)
    ```python
    trades = load_data(files, kind="trades")
    book_ticker = load_data(files, kind="book_ticker")
    ```
 
-2. **生成本地时间戳序列**
+2. **Generate local timestamp sequence**
    ```python
-   # 以固定间隔（如 1 秒）生成策略运行时间点
+   # Generate strategy execution time points at fixed intervals (e.g., 1 second)
    local_ts = np.arange(start_ts, end_ts, interval_ns)
    ```
 
-3. **事件驱动迭代**（见 [utils.py:363-477](src/nanobt/utils.py#L363-L477)）
+3. **Event-driven iteration** (see [utils.py:363-477](src/nanobt/utils.py#L363-L477))
 
-   使用 **Clock** 对象管理四个事件流：
-   - `book_ticker_exch_clock`：交易所时间戳的报价更新
-   - `book_ticker_local_clock`：本地时间戳的报价更新
-   - `trades_exch_clock`：逐笔成交数据
-   - `local_clock`：策略运行时间点
+   Use **Clock** objects to manage four event streams:
+   - `book_ticker_exch_clock`: Best bid/ask updates at exchange timestamps
+   - `book_ticker_local_clock`: Best bid/ask updates at local timestamps
+   - `trades_exch_clock`: Trade-by-trade data
+   - `local_clock`: Strategy execution time points
 
-   **每次迭代**选择最早时间戳的事件处理：
+   **Each iteration** processes the earliest timestamp event:
    ```python
    ev = select_event([
        book_ticker_exch_clock.ts,
@@ -227,95 +227,95 @@ if normalized_position < -1:  # 空仓超限
    ])
    ```
 
-4. **计算填充价格**
+4. **Calculate fill prices**
 
-   每到达一个 `local_ts[t]`，调用 `ack_order` 函数计算三个窗口的填充价格：
+   At each `local_ts[t]`, call `ack_order` function to compute fill prices for three windows:
    ```python
-   # W0: 遗留订单
+   # W0: Legacy orders
    bid_fill_tick = min(low_sell_tick + 1, low_best_ask_tick)
    ask_fill_tick = max(high_buy_tick - 1, high_best_bid_tick)
 
-   # W1 & W2: 通过 ack_order 函数计算
+   # W1 & W2: Computed via ack_order function
    (bid_fill_tick_ack, ask_fill_tick_ack,
     best_bid_tick_ack, best_ask_tick_ack,
     bid_fill_tick_after_ack, ask_fill_tick_after_ack) = ack_order(...)
    ```
 
-5. **输出预处理表**
+5. **Output preprocessed table**
 
-   返回 Polars DataFrame，每行对应一个策略时间点：
+   Returns Polars DataFrame with one row per strategy time point:
    ```python
    {
-       'local_ts',               # 本地时间戳
-       'best_bid_tick',          # 本地最优买价
-       'best_ask_tick',          # 本地最优卖价
-       'bid_fill_tick',          # W0 买单成交价
-       'ask_fill_tick',          # W0 卖单成交价
-       'order_ack_ts',           # 订单确认时间戳
-       'bid_fill_tick_ack',      # W1 买单成交价
-       'ask_fill_tick_ack',      # W1 卖单成交价
-       'best_bid_tick_ack',      # 订单确认时最优买价
-       'best_ask_tick_ack',      # 订单确认时最优卖价
-       'bid_fill_tick_after_ack', # W2 买单成交价
-       'ask_fill_tick_after_ack'  # W2 卖单成交价
+       'local_ts',               # Local timestamp
+       'best_bid_tick',          # Local best bid price
+       'best_ask_tick',          # Local best ask price
+       'bid_fill_tick',          # W0 buy order fill price
+       'ask_fill_tick',          # W0 sell order fill price
+       'order_ack_ts',           # Order acknowledgment timestamp
+       'bid_fill_tick_ack',      # W1 buy order fill price
+       'ask_fill_tick_ack',      # W1 sell order fill price
+       'best_bid_tick_ack',      # Best bid at order acknowledgment
+       'best_ask_tick_ack',      # Best ask at order acknowledgment
+       'bid_fill_tick_after_ack', # W2 buy order fill price
+       'ask_fill_tick_after_ack'  # W2 sell order fill price
    }
    ```
 
 ---
 
-## 回测执行流程
+## Backtesting Execution Flow
 
-[accelerated_backtest](main.py#L9-L203) 函数的主循环逻辑：
+[accelerated_backtest](main.py#L9-L203) function's main loop logic:
 
-### 1. 策略决策（本地逻辑）
-在每个 `local_ts[t]` 时刻：
+### 1. Strategy Decision (Local Logic)
+At each `local_ts[t]` timestamp:
 ```python
-# 计算中间价和持仓
+# Calculate mid price and position
 mid_tick = (best_bid_tick[t] + best_ask_tick[t]) / 2.0
 normalized_position = (position * mid_px) / max_notional_position
 
-# 根据策略生成新订单
-req_bid_tick = ...  # 计算买单价格
-req_ask_tick = ...  # 计算卖单价格
+# Generate new orders based on strategy
+req_bid_tick = ...  # Calculate buy order price
+req_ask_tick = ...  # Calculate sell order price
 ```
 
-### 2. 交易所逻辑（撮合判定）
-分两种情况：
+### 2. Exchange Logic (Fill Determination)
+Two cases:
 
-#### 情况 A：订单有变化（发出修改/新订单）
+#### Case A: Order Changes (Send new/modified orders)
 ```python
 if req_bid_tick != open_bid_tick or req_ask_tick != open_ask_tick:
-    # 1. 检查遗留订单是否在 W1 窗口成交
+    # 1. Check if legacy orders are filled in W1 window
     if open_bid_tick >= bid_fill_tick_ack[t]:
-        # 执行成交
+        # Execute fill
 
-    # 2. GTX 检查：拒绝穿价订单
+    # 2. GTX check: reject orders that cross spread
     if req_bid_tick >= best_ask_tick_ack[t]:
         req_bid_tick = INVALID_MIN
 
-    # 3. 接受新订单
+    # 3. Accept new orders
     open_bid_tick = req_bid_tick
 
-    # 4. 检查新订单是否在 W2 窗口成交
+    # 4. Check if new orders are filled in W2 window
     if open_bid_tick >= bid_fill_tick_after_ack[t]:
-        # 执行成交
+        # Execute fill
 
-    # 5. 跳到下一个 local_ts >= order_ack_ts[t]
+    # 5. Move to next local_ts >= order_ack_ts[t]
     while local_ts[t] < order_ack_ts[t]:
         t += 1
 ```
 
-#### 情况 B：订单无变化（维持原有挂单）
+#### Case B: No Order Changes (Maintain existing orders)
 ```python
 else:
-    # 检查遗留订单是否在 W0 窗口成交
+    # Check if legacy orders are filled in W0 window
     t += 1
     if open_bid_tick >= bid_fill_tick[t]:
-        # 执行成交
+        # Execute fill
 ```
 
-### 3. 状态记录
-每次迭代记录当前状态：
+### 3. State Record
+Record current state each iteration:
 ```python
 record[rec_i] = {
     'timestamp': local_ts[t],
@@ -329,63 +329,63 @@ record[rec_i] = {
 
 ---
 
-## 使用示例
+## Usage Example
 
-### 快速开始
+### Quick Start
 
 ```python
 from datetime import UTC, datetime
 from nanobt.utils import preprocess_data
 from nanobt.stats import LinearAssetRecord
 
-# 1. 预处理数据
+# 1. Preprocess data
 table = preprocess_data(
-    tick_size=0.1,           # 最小价格变动：0.1 USDT
-    lot_size=0.001,          # 最小数量变动：0.001 BTC
-    interval_ns=1_000_000_000,  # 策略运行间隔：1秒
+    tick_size=0.1,           # Minimum price increment: 0.1 USDT
+    lot_size=0.001,          # Minimum quantity increment: 0.001 BTC
+    interval_ns=1_000_000_000,  # Strategy execution interval: 1 second
     start_date=datetime(2025, 11, 5, tzinfo=UTC),
     end_date=datetime(2025, 11, 10, tzinfo=UTC),
-    base_dir="/share/tardis/raw/",  # 数据目录
+    base_dir="/share/tardis/raw/",  # Data directory
     exchange="binance-futures",
     symbol="BTCUSDT"
 )
 
-# 2. 运行回测
+# 2. Run backtest
 record = accelerated_backtest(
-    relative_half_spread=0.00025,  # 半价差
-    skew=0.00025,                  # 偏度系数
-    order_notional_value=50000,    # 单次订单价值
-    max_notional_position=1000000, # 最大持仓
-    fee=-0.00005,                  # 手续费率（负数为返佣）
+    relative_half_spread=0.00025,  # Half spread
+    skew=0.00025,                  # Skew coefficient
+    order_notional_value=50000,    # Order value
+    max_notional_position=1000000, # Max position
+    fee=-0.00005,                  # Fee rate (negative for rebates)
     tick_size=0.1,
     lot_size=0.001,
-    **table.to_dict(as_series=False)  # 传入预处理数据
+    **table.to_dict(as_series=False)  # Pass preprocessed data
 )
 
-# 3. 统计分析
+# 3. Statistical analysis
 stats = (
     LinearAssetRecord(record)
         .resample('1s')
         .stats(book_size=1000000)
 )
 
-print(stats.summary())  # 打印统计指标
-fig = stats.plot()      # 绘制权益曲线
+print(stats.summary())  # Print statistics
+fig = stats.plot()      # Plot equity curve
 fig.savefig('backtest_result.png')
 ```
 
-### 自定义策略
+### Custom Strategy
 
-修改 [main.py:64-84](main.py#L64-L84) 的策略逻辑：
+Modify the strategy logic in [main.py:64-84](main.py#L64-L84):
 
 ```python
-# 示例：固定价差做市策略
+# Example: Fixed spread market making strategy
 def custom_strategy(mid_tick, position, best_bid_tick, best_ask_tick):
-    spread = 5  # 固定 5 个 tick 的价差
+    spread = 5  # Fixed 5-tick spread
     req_bid_tick = mid_tick - spread
     req_ask_tick = mid_tick + spread
 
-    # 确保不穿过盘口
+    # Ensure orders don't cross spread
     req_bid_tick = min(req_bid_tick, best_bid_tick)
     req_ask_tick = max(req_ask_tick, best_ask_tick)
 
@@ -394,71 +394,71 @@ def custom_strategy(mid_tick, position, best_bid_tick, best_ask_tick):
 
 ---
 
-## 性能优化
+## Performance Optimization
 
-### Numba JIT 编译
-所有核心函数使用 `@njit` 装饰器，编译为机器码：
+### Numba JIT Compilation
+All core functions use `@njit` decorator for machine code compilation:
 ```python
 @njit
 def accelerated_backtest(...):
-    # 首次运行会编译，后续调用接近 C 语言性能
+    # First run compiles; subsequent calls run at near-C performance
 ```
 
-### 内存优化
-- 使用 `np.empty` 预分配数组（见 [main.py:59](main.py#L59)）
-- 价格统一转换为 tick（整数）避免浮点数误差
-- Structured Array 存储记录数据（见 [types.py:39-51](src/nanobt/types.py#L39-L51)）
+### Memory Optimization
+- Pre-allocate arrays with `np.empty` (see [main.py:59](main.py#L59))
+- Convert prices to ticks (integers) to avoid floating-point errors
+- Store records in Structured Arrays (see [types.py:39-51](src/nanobt/types.py#L39-L51))
 
-### 并行化潜力
-- 不同参数组合可并行回测（网格搜索）
-- Polars 数据加载自动多线程优化
-
----
-
-## 局限性与注意事项
-
-1. **无队列位置建模**
-   - 在低流动性或高频策略中可能低估被动成交概率
-   - 建议与完整回测对比验证关键策略
-
-2. **无部分成交**
-   - 订单要么完全成交要么不成交
-   - 适用于订单量远小于盘口深度的策略
-
-3. **延迟模型简化**
-   - 当前使用固定延迟，真实网络延迟有波动
-   - 可扩展为历史数据驱动的插值模型
-
-4. **费用模型**
-   - 示例使用固定费率（Maker 返佣 0.005%）
-   - 实际需根据交易所 VIP 等级调整
+### Parallelization Potential
+- Different parameter combinations can be backtested in parallel (grid search)
+- Polars data loading is automatically multi-threaded
 
 ---
 
-## 依赖环境
+## Limitations and Caveats
+
+1. **No Queue Position Modeling**
+   - May underestimate passive fill probability in low-liquidity or high-frequency strategies
+   - Recommend comparing with full-order-book backtesting to validate critical strategies
+
+2. **No Partial Fills**
+   - Orders are either fully filled or not filled
+   - Suitable for strategies where order size is much smaller than order book depth
+
+3. **Simplified Latency Model**
+   - Currently uses fixed latency; real network latency varies
+   - Can be extended to historical-data-driven interpolation models
+
+4. **Simplified Fee Model**
+   - Example uses fixed fee rate (Maker rebate 0.005%)
+   - Actual rate needs adjustment based on exchange VIP tier
+
+---
+
+## Dependencies
 
 ```bash
 uv sync
 ```
 
-核心依赖：
-- **NumPy**：数组运算
-- **Numba**：JIT 编译加速
-- **Polars**：高性能数据处理（比 Pandas 快 5-10 倍）
+Core dependencies:
+- **NumPy**: Array operations
+- **Numba**: JIT compilation acceleration
+- **Polars**: High-performance data processing (5-10x faster than Pandas)
 
 ---
 
-## 文件结构
+## File Structure
 
 ```
 nanobt/
-├── main.py                    # 回测主流程 + 示例策略
+├── main.py                    # Backtest main loop + example strategy
 ├── src/nanobt/
-│   ├── types.py              # 数据类型定义（Schema, Constants）
-│   ├── utils.py              # 数据加载与预处理
-│   └── stats/                # 统计分析模块
-│       ├── stats.py          # Stats 类（指标计算）
-│       ├── metrics.py        # 各类指标定义
-│       └── utils.py          # 辅助函数
+│   ├── types.py              # Data type definitions (Schema, Constants)
+│   ├── utils.py              # Data loading and preprocessing
+│   └── stats/                # Statistical analysis module
+│       ├── stats.py          # Stats class (metric calculation)
+│       ├── metrics.py        # Various metric definitions
+│       └── utils.py          # Helper functions
 └── README.md
 ```

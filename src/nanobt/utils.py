@@ -69,20 +69,20 @@ def load_data(
     *,
     start: Optional[datetime] = None,  # datetime → ns
     end: Optional[datetime] = None,  # datetime → ns
-    kind: Kind,  # 必须显式指定
-    format: Format = "parquet",  # 文件格式
+    kind: Kind,  # Must be explicitly specified
+    format: Format = "parquet",  # File format
     to_numpy: bool = True,
     time_col: TIME_COL = "exch_ts",
-    sort_by: Optional[TIME_COL] = "exch_ts",  # None = 不排序
+    sort_by: Optional[TIME_COL] = "exch_ts",  # None = don't sort
 ):
     """
     Load ONE kind of data using Polars scan_parquet or scan_csv.
 
     - files: str | list[str]
-        - 可以是 glob pattern（scan_parquet/scan_csv 自己处理）
-        - 可以是 list[path]
-    - kind: "trades" | "book_ticker"（必须指定）
-    - format: "parquet" | "csv"（默认 parquet）
+        - Can be a glob pattern (scan_parquet/scan_csv handles it)
+        - Can be list[path]
+    - kind: "trades" | "book_ticker" (must specify)
+    - format: "parquet" | "csv" (default parquet)
     """
     start_ns = datetime_to_ns(start) if start is not None else None
     end_ns = datetime_to_ns(end) if end is not None else None
@@ -193,7 +193,7 @@ def ack_order(
         if ev == -1:
             raise ValueError
         elif ev == 0:
-            # 寻找[local_ts[t], order_ack_ts[t]]区间和[order_ack_ts[t], local_ts[t + n]]区间的best bid和best ask
+            # Find best bid and best ask for [local_ts[t], order_ack_ts[t]] and [order_ack_ts[t], local_ts[t + n]] intervals
             best_bid_tick = round(
                 book_ticker[book_ticker_exch_clock.rn].bid_px / tick_size
             )
@@ -208,7 +208,7 @@ def ack_order(
 
             book_ticker_exch_clock.next()
         elif ev == 1:
-            # 寻找[local_ts[t], order_ack_ts[t]]区间和[order_ack_ts[t], local_ts[t + n]]区间的trade price
+            # Find trade prices for [local_ts[t], order_ack_ts[t]] and [order_ack_ts[t], local_ts[t + n]] intervals
             side = trades[trades_exch_clock.rn].side
             px_tick = round(trades[trades_exch_clock.rn].px / tick_size)
 
@@ -219,15 +219,15 @@ def ack_order(
 
             trades_exch_clock.next()
         elif ev == 2:
-            # 描述的是[local_ts[t], order_ack_ts[t]]区间的情况，即新订单还未到达交易所
+            # Describes the [local_ts[t], order_ack_ts[t]] interval case, i.e., new order hasn't reached exchange yet
             # An order request is acknowledged by the exchange at order_ack_ts[t].
             bid_fill_tick_ack = min(low_sell_tick + 1, low_best_ask_tick)
             ask_fill_tick_ack = max(high_buy_tick - 1, high_best_bid_tick)
-            best_bid_tick_ack = best_bid_tick  # 记录订单到达交易所的best_bid_tick
-            best_ask_tick_ack = best_ask_tick  # 记录订单到达交易所的best_ask_tick
+            best_bid_tick_ack = best_bid_tick  # Record the best_bid_tick when order reaches exchange
+            best_ask_tick_ack = best_ask_tick  # Record the best_ask_tick when order reaches exchange
 
-            # 重新初始化 进入[order_ack_ts[t], local_ts[t + n]]区间的计算
-            # 注意这里不是t+1，而是t+n，因为order_latency可能更长
+            # Reinitialize for entering the [order_ack_ts[t], local_ts[t + n]] interval calculation
+            # Note: this is not necessarily t+1, but t+n, since order latency may span multiple local time steps
             high_buy_tick = INVALID_MIN
             high_best_bid_tick = best_bid_tick
             low_sell_tick = INVALID_MAX
@@ -235,7 +235,7 @@ def ack_order(
 
             order_ack_ts = INVALID_MAX
         elif ev == 3:
-            # 描述的是[order_ack_ts[t], local_ts[t + n]]区间的情况，即新订单已经到达交易所
+            # Describes the [order_ack_ts[t], local_ts[t + n]] interval case, i.e., new order has reached exchange
             # at local_ts[t + n] > order_ack_ts[t]
             bid_fill_tick = min(low_sell_tick + 1, low_best_ask_tick)
             ask_fill_tick = max(high_buy_tick - 1, high_best_bid_tick)
@@ -287,26 +287,26 @@ def _preprocess_data(
     fixed_entry_lat_ns : int
         The fixed latency in nanoseconds for order entry from local system to exchange.
     """
-    # W0 = local_ts[t-1] ~ local_ts[t] # 遗留订单是否会被filled
-    # W1 = local_ts[t] ~ order_ack_ts[t] # 描述的是对于modify order/cancel order来说，这个订单是否会被filled
-    # W2 = order_ack_ts[t] ~ local_ts[t + n] where local_ts[t + n] > order_ack_ts[t] # 新订单是否会在这个窗口内被filled
+    # W0 = local_ts[t-1] ~ local_ts[t] # Whether legacy orders are filled
+    # W1 = local_ts[t] ~ order_ack_ts[t] # For modify/cancel orders, whether the order is filled
+    # W2 = order_ack_ts[t] ~ local_ts[t + n] where local_ts[t + n] > order_ack_ts[t] # Whether new orders are filled in this window
 
-    # out_bid_fill_tick, out_ask_fill_tick: 用于判断在local_ts[t-1]~local_ts[t]区间内的订单是否被成交，即遗留订单的成交情况
-    # out_bid_fill_tick_ack, out_ask_fill_tick_ack: 用于判断在local_ts[t]~order_ack_ts[t]区间内的订单是否被成交，即判断在发出modify/cancel订单后，在订单到达交易所前，订单是否被成交
-    # out_bid_fill_tick_after_ack, out_ask_fill_tick_after_ack: 用于判断在order_ack_ts[t]~local_ts[t + n]区间内的订单是否被成交，即新订单的成交情况
+    # out_bid_fill_tick, out_ask_fill_tick: Used to determine if orders in local_ts[t-1]~local_ts[t] interval are filled, i.e., legacy order fill status
+    # out_bid_fill_tick_ack, out_ask_fill_tick_ack: Used to determine if orders in local_ts[t]~order_ack_ts[t] interval are filled, i.e., if order is filled before reaching exchange after sending modify/cancel
+    # out_bid_fill_tick_after_ack, out_ask_fill_tick_after_ack: Used to determine if orders in order_ack_ts[t]~local_ts[t + n] interval are filled, i.e., new order fill status
 
     # Preprocessed data
     # All prices are in ticks to avoid additional operations to prevent floating-point comparison errors.
 
     # W0 = [local_ts[t-1], local_ts[t]]
-    #   -> 遗留订单（已经在交易所挂着的 open orders）在上一段内是否会被 filled
+    #   -> Whether legacy orders (already open orders on the exchange) are filled in this previous segment
 
     # W1 = [local_ts[t], order_ack_ts[t]]
-    #   -> 本地在 t 发出 cancel/modify 等请求后、请求到达交易所前，
-    #      该遗留订单是否会先被 filled（撤单/改单来不及）
+    #   -> After local system sends cancel/modify request at t, whether the legacy order will be
+    #      filled first before the request reaches exchange (cancel/modify timeout)
 
     # W2 = [order_ack_ts[t], next_local_ts]  where next_local_ts = first local_ts >= order_ack_ts[t]
-    #   -> 本行新发订单到达交易所后，到下一次本地观测点之间是否会被 filled
+    #   -> After newly issued orders reach the exchange, whether they are filled before the next local observation point
 
     out_t = 0
     out_size = len(local_ts)
@@ -355,8 +355,8 @@ def _preprocess_data(
     low_sell_tick = low_best_ask_tick = INVALID_MAX
 
     # Initializes the clocks
-    # todo: For better accuracy, it also needs to combine the best bid and ask from Level-2 market depth data
-    #       with the best bid and ask from the book ticker.
+    # todo: For better accuracy, also need to combine best bid and ask from Level-2 market depth data
+    #       with best bid and ask from book ticker.
     book_ticker_exch_clock = Clock(book_ticker_exch_ts, 0)  # rn = 0
     book_ticker_local_clock = Clock(book_ticker_local_ts, 0)  # rn = 0
     trades_exch_clock = Clock(trades_exch_ts, 0)  # rn = 0
@@ -425,8 +425,8 @@ def _preprocess_data(
             out_bid_fill_tick[out_t] = min(low_sell_tick + 1, low_best_ask_tick)
             out_ask_fill_tick[out_t] = max(high_buy_tick - 1, high_best_bid_tick)
 
-            high_buy_tick = INVALID_MIN  # 如果没有trade更新，我们就让它为最小值
-            high_best_bid_tick = exch_best_bid_tick  # reset to current exch best bid, 因为下一段区间可能没有book更新
+            high_buy_tick = INVALID_MIN  # If no trade updates, set to minimum value
+            high_best_bid_tick = exch_best_bid_tick  # Reset to current exch best bid, as next interval may have no book updates
             low_sell_tick = INVALID_MAX
             low_best_ask_tick = exch_best_ask_tick
 
